@@ -10,10 +10,8 @@ from abc import abstractmethod
 from .util import (
     checkpoint,
     conv_nd,
-    linear,
     avg_pool_nd,
     zero_module,
-    normalization,
     timestep_embedding,
 )
 from .attention import SpatialTransformer, SpatialTransformer3D
@@ -56,7 +54,7 @@ class MultiViewUNetWrapperModel(ModelMixin, ConfigMixin):
             adm_in_channels=None,
             camera_dim=None,):
         super().__init__()
-        self.unet: MultiViewUNetModel = MultiViewUNetModel(
+        self.unet = MultiViewUNetModel(
             image_size=image_size,
             in_channels=in_channels,
             model_channels=model_channels,
@@ -218,7 +216,7 @@ class ResBlock(TimestepBlock):
         self.use_scale_shift_norm = use_scale_shift_norm
 
         self.in_layers = nn.Sequential(
-            normalization(channels),
+            nn.GroupNorm(32, channels),
             nn.SiLU(),
             conv_nd(dims, channels, self.out_channels, 3, padding=1),
         )
@@ -236,13 +234,13 @@ class ResBlock(TimestepBlock):
 
         self.emb_layers = nn.Sequential(
             nn.SiLU(),
-            linear(
+            nn.Linear(
                 emb_channels,
                 2 * self.out_channels if use_scale_shift_norm else self.out_channels,
             ),
         )
         self.out_layers = nn.Sequential(
-            normalization(self.out_channels),
+            nn.GroupNorm(32, self.out_channels),
             nn.SiLU(),
             nn.Dropout(p=dropout),
             zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)),
@@ -310,7 +308,7 @@ class AttentionBlock(nn.Module):
             assert (channels % num_head_channels == 0), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
             self.num_heads = channels // num_head_channels
         self.use_checkpoint = use_checkpoint
-        self.norm = normalization(channels)
+        self.norm = nn.GroupNorm(32, channels)
         self.qkv = conv_nd(1, channels, channels * 3, 1)
         if use_new_attention_order:
             # split qkv before split heads
@@ -416,16 +414,6 @@ class QKVAttention(nn.Module):
     @staticmethod
     def count_flops(model, _x, y):
         return count_flops_attn(model, _x, y)
-
-
-class Timestep(nn.Module):
-
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, t):
-        return timestep_embedding(t, self.dim)
 
 
 class MultiViewUNetModel(nn.Module):
@@ -545,17 +533,17 @@ class MultiViewUNetModel(nn.Module):
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
-            linear(model_channels, time_embed_dim),
+            nn.Linear(model_channels, time_embed_dim),
             nn.SiLU(),
-            linear(time_embed_dim, time_embed_dim),
+            nn.Linear(time_embed_dim, time_embed_dim),
         )
 
         if camera_dim is not None:
             time_embed_dim = model_channels * 4
             self.camera_embed = nn.Sequential(
-                linear(camera_dim, time_embed_dim),
+                nn.Linear(camera_dim, time_embed_dim),
                 nn.SiLU(),
-                linear(time_embed_dim, time_embed_dim),
+                nn.Linear(time_embed_dim, time_embed_dim),
             )
 
         if self.num_classes is not None:
@@ -567,9 +555,9 @@ class MultiViewUNetModel(nn.Module):
             elif self.num_classes == "sequential":
                 assert adm_in_channels is not None
                 self.label_emb = nn.Sequential(nn.Sequential(
-                    linear(adm_in_channels, time_embed_dim),
+                    nn.Linear(adm_in_channels, time_embed_dim),
                     nn.SiLU(),
-                    linear(time_embed_dim, time_embed_dim),
+                    nn.Linear(time_embed_dim, time_embed_dim),
                 ))
             else:
                 raise ValueError()
@@ -722,13 +710,13 @@ class MultiViewUNetModel(nn.Module):
                 self._feature_size += ch
 
         self.out = nn.Sequential(
-            normalization(ch),
+            nn.GroupNorm(32, ch),
             nn.SiLU(),
             zero_module(conv_nd(dims, model_channels, out_channels, 3, padding=1)),
         )
         if self.predict_codebook_ids:
             self.id_predictor = nn.Sequential(
-                normalization(ch),
+                nn.GroupNorm(32, ch),
                 conv_nd(dims, model_channels, n_embed, 1),
                 #nn.LogSoftmax(dim=1)  # change to cross_entropy and produce non-normalized logits
             )

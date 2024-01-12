@@ -12,7 +12,14 @@ wget https://raw.githubusercontent.com/bytedance/MVDream/main/mvdream/configs/sd
 python convert_mvdream_to_diffusers.py --checkpoint_path ./sd-v2.1-base-4view.pt --dump_path ./weights --original_config_file ./sd-v2-base.yaml --half --to_safetensors --test
 ```
 
-### run pipeline
+### usage
+
+example:
+```bash
+python main.py "a cute owl"
+```
+
+detailed usage:
 ```python
 import torch
 import kiui
