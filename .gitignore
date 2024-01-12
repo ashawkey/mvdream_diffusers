@@ -1,0 +1,7 @@
+*.pt
+*.yaml
+**/__pycache__
+*.pyc
+
+weights
+sd-v2*
