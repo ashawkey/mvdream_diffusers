@@ -1,8 +1,7 @@
 # obtained and modified from https://github.com/bytedance/MVDream
 
 import math
-import numpy as np
-import torch as th
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin
@@ -223,119 +222,13 @@ class ResBlock(TimestepBlock):
             emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
             out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
-            scale, shift = th.chunk(emb_out, 2, dim=1)
+            scale, shift = torch.chunk(emb_out, 2, dim=1)
             h = out_norm(h) * (1 + scale) + shift
             h = out_rest(h)
         else:
             h = h + emb_out
             h = self.out_layers(h)
         return self.skip_connection(x) + h
-
-
-class AttentionBlock(nn.Module):
-    """
-    An attention block that allows spatial positions to attend to each other.
-    Originally ported from here, but adapted to the N-d case.
-    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
-    """
-
-    def __init__(
-        self,
-        channels,
-        num_heads=1,
-        num_head_channels=-1,
-        use_checkpoint=False,
-        use_new_attention_order=False,
-    ):
-        super().__init__()
-        self.channels = channels
-        if num_head_channels == -1:
-            self.num_heads = num_heads
-        else:
-            assert (
-                channels % num_head_channels == 0
-            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
-            self.num_heads = channels // num_head_channels
-        self.use_checkpoint = use_checkpoint
-        self.norm = nn.GroupNorm(32, channels)
-        self.qkv = conv_nd(1, channels, channels * 3, 1)
-        if use_new_attention_order:
-            # split qkv before split heads
-            self.attention = QKVAttention(self.num_heads)
-        else:
-            # split heads before split qkv
-            self.attention = QKVAttentionLegacy(self.num_heads)
-
-        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
-
-    def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)
-
-    def _forward(self, x):
-        b, c, *spatial = x.shape
-        x = x.reshape(b, c, -1)
-        qkv = self.qkv(self.norm(x))
-        h = self.attention(qkv)
-        h = self.proj_out(h)
-        return (x + h).reshape(b, c, *spatial)
-
-
-class QKVAttentionLegacy(nn.Module):
-    """
-    A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping
-    """
-
-    def __init__(self, n_heads):
-        super().__init__()
-        self.n_heads = n_heads
-
-    def forward(self, qkv):
-        """
-        Apply QKV attention.
-        :param qkv: an [N x (H * 3 * C) x T] tensor of Qs, Ks, and Vs.
-        :return: an [N x (H * C) x T] tensor after attention.
-        """
-        bs, width, length = qkv.shape
-        assert width % (3 * self.n_heads) == 0
-        ch = width // (3 * self.n_heads)
-        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = th.einsum(
-            "bct,bcs->bts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v)
-        return a.reshape(bs, -1, length)
-
-
-class QKVAttention(nn.Module):
-    """
-    A module which performs QKV attention and splits in a different order.
-    """
-
-    def __init__(self, n_heads):
-        super().__init__()
-        self.n_heads = n_heads
-
-    def forward(self, qkv):
-        """
-        Apply QKV attention.
-        :param qkv: an [N x (3 * H * C) x T] tensor of Qs, Ks, and Vs.
-        :return: an [N x (H * C) x T] tensor after attention.
-        """
-        bs, width, length = qkv.shape
-        assert width % (3 * self.n_heads) == 0
-        ch = width // (3 * self.n_heads)
-        q, k, v = qkv.chunk(3, dim=1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = th.einsum(
-            "bct,bcs->bts",
-            (q * scale).view(bs * self.n_heads, ch, length),
-            (k * scale).view(bs * self.n_heads, ch, length),
-        )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
-        return a.reshape(bs, -1, length)
 
 
 class MultiViewUNetModel(ModelMixin, ConfigMixin):
@@ -388,34 +281,18 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         num_heads_upsample=-1,
         use_scale_shift_norm=False,
         resblock_updown=False,
-        use_new_attention_order=False,
-        use_spatial_transformer=False,  # custom transformer support
         transformer_depth=1,  # custom transformer support
         context_dim=None,  # custom transformer support
         n_embed=None,  # custom support for prediction of discrete ids into codebook of first stage vq model
-        legacy=True,
         disable_self_attentions=None,
         num_attention_blocks=None,
         disable_middle_self_attn=False,
-        use_linear_in_transformer=False,
         adm_in_channels=None,
         camera_dim=None,
     ):
         super().__init__()
-        if use_spatial_transformer:
-            assert (
-                context_dim is not None
-            ), "Fool!! You forgot to include the dimension of your cross-attention conditioning..."
-
-        if context_dim is not None:
-            assert (
-                use_spatial_transformer
-            ), "Fool!! You forgot to use the spatial transformer for your cross-attention conditioning..."
-            from omegaconf.listconfig import ListConfig
-
-            if type(context_dim) == ListConfig:
-                context_dim = list(context_dim)
-
+        assert context_dim is not None
+        
         if num_heads_upsample == -1:
             num_heads_upsample = num_heads
 
@@ -535,13 +412,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                     else:
                         num_heads = ch // num_head_channels
                         dim_head = num_head_channels
-                    if legacy:
-                        # num_heads = 1
-                        dim_head = (
-                            ch // num_heads
-                            if use_spatial_transformer
-                            else num_head_channels
-                        )
+                    
                     if disable_self_attentions is not None:
                         disabled_sa = disable_self_attentions[level]
                     else:
@@ -549,22 +420,13 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
 
                     if num_attention_blocks is None or nr < num_attention_blocks[level]:
                         layers.append(
-                            AttentionBlock(
-                                ch,
-                                use_checkpoint=use_checkpoint,
-                                num_heads=num_heads,
-                                num_head_channels=dim_head,
-                                use_new_attention_order=use_new_attention_order,
-                            )
-                            if not use_spatial_transformer
-                            else SpatialTransformer3D(
+                            SpatialTransformer3D(
                                 ch,
                                 num_heads,
                                 dim_head,
                                 depth=transformer_depth,
                                 context_dim=context_dim,
                                 disable_self_attn=disabled_sa,
-                                use_linear=use_linear_in_transformer,
                                 use_checkpoint=use_checkpoint,
                             )
                         )
@@ -601,9 +463,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         else:
             num_heads = ch // num_head_channels
             dim_head = num_head_channels
-        if legacy:
-            # num_heads = 1
-            dim_head = ch // num_heads if use_spatial_transformer else num_head_channels
+        
         self.middle_block = TimestepEmbedSequential(
             ResBlock(
                 ch,
@@ -613,24 +473,15 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
-            AttentionBlock(
-                ch,
-                use_checkpoint=use_checkpoint,
-                num_heads=num_heads,
-                num_head_channels=dim_head,
-                use_new_attention_order=use_new_attention_order,
-            )
-            if not use_spatial_transformer
-            else SpatialTransformer3D(
+            SpatialTransformer3D(
                 ch,
                 num_heads,
                 dim_head,
                 depth=transformer_depth,
                 context_dim=context_dim,
                 disable_self_attn=disable_middle_self_attn,
-                use_linear=use_linear_in_transformer,
                 use_checkpoint=use_checkpoint,
-            ),  # always uses a self-attn
+            ), 
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -664,13 +515,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                     else:
                         num_heads = ch // num_head_channels
                         dim_head = num_head_channels
-                    if legacy:
-                        # num_heads = 1
-                        dim_head = (
-                            ch // num_heads
-                            if use_spatial_transformer
-                            else num_head_channels
-                        )
+                    
                     if disable_self_attentions is not None:
                         disabled_sa = disable_self_attentions[level]
                     else:
@@ -678,22 +523,13 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
 
                     if num_attention_blocks is None or i < num_attention_blocks[level]:
                         layers.append(
-                            AttentionBlock(
-                                ch,
-                                use_checkpoint=use_checkpoint,
-                                num_heads=num_heads_upsample,
-                                num_head_channels=dim_head,
-                                use_new_attention_order=use_new_attention_order,
-                            )
-                            if not use_spatial_transformer
-                            else SpatialTransformer3D(
+                            SpatialTransformer3D(
                                 ch,
                                 num_heads,
                                 dim_head,
                                 depth=transformer_depth,
                                 context_dim=context_dim,
                                 disable_self_attn=disabled_sa,
-                                use_linear=use_linear_in_transformer,
                                 use_checkpoint=use_checkpoint,
                             )
                         )
@@ -777,7 +613,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
             hs.append(h)
         h = self.middle_block(h, emb, context, num_frames=num_frames)
         for module in self.output_blocks:
-            h = th.cat([h, hs.pop()], dim=1)
+            h = torch.cat([h, hs.pop()], dim=1)
             h = module(h, emb, context, num_frames=num_frames)
         h = h.type(x.dtype)
         if self.predict_codebook_ids:

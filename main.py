@@ -5,8 +5,8 @@ import argparse
 from mvdream.pipeline_mvdream import MVDreamStableDiffusionPipeline
 
 pipe = MVDreamStableDiffusionPipeline.from_pretrained(
-    # "./weights", # local weights
-    "ashawkey/mvdream-sd2.1-diffusers",
+    "./weights", # local weights
+    # "ashawkey/mvdream-sd2.1-diffusers",
     torch_dtype=torch.float16
 )
 pipe = pipe.to("cuda")
