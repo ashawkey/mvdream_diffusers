@@ -1,6 +1,3 @@
-# obtained and modified from https://github.com/bytedance/MVDream
-
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +6,6 @@ from diffusers.models.modeling_utils import ModelMixin
 from typing import Any, List, Optional
 from torch import Tensor
 
-from abc import abstractmethod
 from .util import (
     checkpoint,
     conv_nd,
@@ -19,19 +15,8 @@ from .util import (
 )
 from .attention import SpatialTransformer, SpatialTransformer3D
 
-class TimestepBlock(nn.Module):
-    """
-    Any module where forward() takes timestep embeddings as a second argument.
-    """
 
-    @abstractmethod
-    def forward(self, x, emb):
-        """
-        Apply the module to `x` given `emb` timestep embeddings.
-        """
-
-
-class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
+class CondSequential(nn.Sequential):
     """
     A sequential module that passes timestep embeddings to the children that
     support it as an extra input.
@@ -39,7 +24,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
 
     def forward(self, x, emb, context=None, num_frames=1):
         for layer in self:
-            if isinstance(layer, TimestepBlock):
+            if isinstance(layer, ResBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer3D):
                 x = layer(x, context, num_frames=num_frames)
@@ -117,7 +102,7 @@ class Downsample(nn.Module):
         return self.op(x)
 
 
-class ResBlock(TimestepBlock):
+class ResBlock(nn.Module):
     """
     A residual block that can optionally change the number of channels.
     :param channels: the number of input channels.
@@ -289,6 +274,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         disable_middle_self_attn=False,
         adm_in_channels=None,
         camera_dim=None,
+        **kwargs,
     ):
         super().__init__()
         assert context_dim is not None
@@ -383,7 +369,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
 
         self.input_blocks = nn.ModuleList(
             [
-                TimestepEmbedSequential(
+                CondSequential(
                     conv_nd(dims, in_channels, model_channels, 3, padding=1)
                 )
             ]
@@ -430,13 +416,13 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                                 use_checkpoint=use_checkpoint,
                             )
                         )
-                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                self.input_blocks.append(CondSequential(*layers))
                 self._feature_size += ch
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
                 out_ch = ch
                 self.input_blocks.append(
-                    TimestepEmbedSequential(
+                    CondSequential(
                         ResBlock(
                             ch,
                             time_embed_dim,
@@ -464,7 +450,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
             num_heads = ch // num_head_channels
             dim_head = num_head_channels
         
-        self.middle_block = TimestepEmbedSequential(
+        self.middle_block = CondSequential(
             ResBlock(
                 ch,
                 time_embed_dim,
@@ -550,7 +536,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                     )
                     ds //= 2
-                self.output_blocks.append(TimestepEmbedSequential(*layers))
+                self.output_blocks.append(CondSequential(*layers))
                 self._feature_size += ch
 
         self.out = nn.Sequential(

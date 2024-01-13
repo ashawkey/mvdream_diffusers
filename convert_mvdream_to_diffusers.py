@@ -405,6 +405,12 @@ def convert_from_original_mvdream_ckpt(checkpoint_path, original_config_file, de
     # )
     # print(f"Unet Config: {original_config.model.params.unet_config.params}")
     unet_config = create_unet_config(original_config)
+
+    # remove unused configs
+    del unet_config['legacy']
+    del unet_config['use_linear_in_transformer']
+    del unet_config['use_spatial_transformer']
+
     unet = MultiViewUNetModel(**unet_config)
     unet.register_to_config(**unet_config)
     # print(f"Unet State Dict: {unet.state_dict().keys()}")

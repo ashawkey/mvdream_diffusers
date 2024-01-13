@@ -4,6 +4,9 @@ modified from https://github.com/KokeCacao/mvdream-hf.
 
 ### convert weights
 ```bash
+# dependency
+pip install -U omegaconf diffusers safetensors huggingface_hub transformers accelerate
+
 # download original ckpt
 wget https://huggingface.co/MVDream/MVDream/resolve/main/sd-v2.1-base-4view.pt
 wget https://raw.githubusercontent.com/bytedance/MVDream/main/mvdream/configs/sd-v2-base.yaml

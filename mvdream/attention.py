@@ -1,6 +1,3 @@
-# obtained and modified from https://github.com/bytedance/MVDream
-
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,9 +11,9 @@ from .util import checkpoint, zero_module
 try:
     import xformers  # type: ignore
     import xformers.ops  # type: ignore
-
     XFORMERS_IS_AVAILBLE = True
 except:
+    print(f'[WARN] xformers is unavailable!')
     XFORMERS_IS_AVAILBLE = False
 
 # CrossAttn precision handling
