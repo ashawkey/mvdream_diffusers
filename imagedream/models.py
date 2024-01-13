@@ -13,8 +13,8 @@ from .util import (
     zero_module,
     timestep_embedding,
 )
-from .attention import SpatialTransformer, SpatialTransformer3D
-
+from .attention import SpatialTransformer3D
+from .adaptor import Resampler, ImageProjModel
 
 class CondSequential(nn.Sequential):
     """
@@ -28,8 +28,6 @@ class CondSequential(nn.Sequential):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer3D):
                 x = layer(x, context, num_frames=num_frames)
-            elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
             else:
                 x = layer(x)
         return x
@@ -274,6 +272,9 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         disable_middle_self_attn=False,
         adm_in_channels=None,
         camera_dim=None,
+        with_ip=True,
+        ip_dim=16,
+        ip_weight=1.0,
         **kwargs,
     ):
         super().__init__()
@@ -305,9 +306,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                     "as a list/tuple (per-level) with the same length as channel_mult"
                 )
             self.num_res_blocks = num_res_blocks
-        if disable_self_attentions is not None:
-            # should be a list of booleans, indicating whether to disable self-attention in TransformerBlocks or not
-            assert len(disable_self_attentions) == len(channel_mult)
+        
         if num_attention_blocks is not None:
             assert len(num_attention_blocks) == len(self.num_res_blocks)
             assert all(
@@ -333,6 +332,22 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.predict_codebook_ids = n_embed is not None
+
+        self.with_ip = with_ip
+        self.ip_dim = ip_dim
+        self.ip_weight = ip_weight
+
+        if self.with_ip and self.ip_dim > 0:
+            self.image_embed = Resampler(
+                dim=context_dim,
+                depth=4,
+                dim_head=64,
+                heads=12,
+                num_queries=ip_dim,  # num token
+                embedding_dim=1280,
+                output_dim=context_dim,
+                ff_mult=4,
+            )
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -398,11 +413,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                     else:
                         num_heads = ch // num_head_channels
                         dim_head = num_head_channels
-                    
-                    if disable_self_attentions is not None:
-                        disabled_sa = disable_self_attentions[level]
-                    else:
-                        disabled_sa = False
 
                     if num_attention_blocks is None or nr < num_attention_blocks[level]:
                         layers.append(
@@ -410,10 +420,12 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                                 ch,
                                 num_heads,
                                 dim_head,
-                                depth=transformer_depth,
                                 context_dim=context_dim,
-                                disable_self_attn=disabled_sa,
+                                depth=transformer_depth,
                                 use_checkpoint=use_checkpoint,
+                                with_ip=self.with_ip,
+                                ip_dim=self.ip_dim,
+                                ip_weight=self.ip_weight,
                             )
                         )
                 self.input_blocks.append(CondSequential(*layers))
@@ -463,10 +475,12 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                 ch,
                 num_heads,
                 dim_head,
-                depth=transformer_depth,
                 context_dim=context_dim,
-                disable_self_attn=disable_middle_self_attn,
+                depth=transformer_depth,
                 use_checkpoint=use_checkpoint,
+                with_ip=self.with_ip,
+                ip_dim=self.ip_dim,
+                ip_weight=self.ip_weight,
             ), 
             ResBlock(
                 ch,
@@ -501,11 +515,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                     else:
                         num_heads = ch // num_head_channels
                         dim_head = num_head_channels
-                    
-                    if disable_self_attentions is not None:
-                        disabled_sa = disable_self_attentions[level]
-                    else:
-                        disabled_sa = False
 
                     if num_attention_blocks is None or i < num_attention_blocks[level]:
                         layers.append(
@@ -513,10 +522,12 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                                 ch,
                                 num_heads,
                                 dim_head,
-                                depth=transformer_depth,
                                 context_dim=context_dim,
-                                disable_self_attn=disabled_sa,
+                                depth=transformer_depth,
                                 use_checkpoint=use_checkpoint,
+                                with_ip=self.with_ip,
+                                ip_dim=self.ip_dim,
+                                ip_weight=self.ip_weight,
                             )
                         )
                 if level and i == self.num_res_blocks[level]:
@@ -559,6 +570,9 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         y: Optional[Tensor] = None,
         camera=None,
         num_frames=1,
+        # should be provided if with_ip
+        ip = None,
+        ip_img = None,
         **kwargs,
     ):
         """
@@ -592,6 +606,11 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         if camera is not None:
             assert camera.shape[0] == emb.shape[0]
             emb = emb + self.camera_embed(camera)
+        
+        if self.with_ip:
+            x[(num_frames - 1) :: num_frames, :, :, :] = ip_img
+            ip_emb = self.image_embed(ip)
+            context = torch.cat((context, ip_emb), 1)
 
         h = x
         for module in self.input_blocks:
