@@ -2,12 +2,13 @@ import torch
 import kiui
 import numpy as np
 import argparse
-from mvdream.pipeline_mvdream import MVDreamPipeline
+from pipeline_mvdream import MVDreamPipeline
 
 pipe = MVDreamPipeline.from_pretrained(
     "./weights_imagedream", # local weights
     # "ashawkey/mvdream-sd2.1-diffusers",
-    torch_dtype=torch.float16
+    torch_dtype=torch.float16,
+    trust_remote_code=True,
 )
 pipe = pipe.to("cuda")
 

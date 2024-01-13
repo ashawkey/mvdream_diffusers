@@ -2,7 +2,7 @@ import torch
 import kiui
 import numpy as np
 import argparse
-from mvdream.pipeline_mvdream import MVDreamPipeline
+from pipeline_mvdream import MVDreamPipeline
 
 pipe = MVDreamPipeline.from_pretrained(
     "./weights_mvdream", # local weights

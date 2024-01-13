@@ -15,10 +15,10 @@ from diffusers.utils import logging
 from typing import Any
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
-from mvdream.models import MultiViewUNetModel
-from mvdream.pipeline_mvdream import MVDreamPipeline
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModel, CLIPImageProcessor
 
+from mv_unet import MultiViewUNetModel
+from pipeline_mvdream import MVDreamPipeline
 import kiui
 
 logger = logging.get_logger(__name__)

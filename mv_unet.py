@@ -1,19 +1,490 @@
+import math
+import numpy as np
+from inspect import isfunction
+from typing import Optional, Any, List
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, repeat
+
 from diffusers.configuration_utils import ConfigMixin
 from diffusers.models.modeling_utils import ModelMixin
-from typing import Any, List
 
-from .util import (
-    checkpoint,
-    conv_nd,
-    avg_pool_nd,
-    zero_module,
-    timestep_embedding,
-)
-from .attention import SpatialTransformer3D
-from .adaptor import Resampler
+# require xformers!
+import xformers
+import xformers.ops
+
+from kiui.cam import orbit_camera
+
+def get_camera(
+    num_frames, elevation=15, azimuth_start=0, azimuth_span=360, blender_coord=True, extra_view=False,
+):
+    angle_gap = azimuth_span / num_frames
+    cameras = []
+    for azimuth in np.arange(azimuth_start, azimuth_span + azimuth_start, angle_gap):
+        
+        pose = orbit_camera(-elevation, azimuth, radius=1) # kiui's elevation is negated, [4, 4]
+
+        # opengl to blender
+        if blender_coord:
+            pose[2] *= -1
+            pose[[1, 2]] = pose[[2, 1]]
+
+        cameras.append(pose.flatten())
+
+    if extra_view:
+        cameras.append(np.zeros_like(cameras[0]))
+
+    return torch.from_numpy(np.stack(cameras, axis=0)).float() # [num_frames, 16]
+
+
+def checkpoint(func, inputs, params, flag):
+    """
+    Evaluate a function without caching intermediate activations, allowing for
+    reduced memory at the expense of extra compute in the backward pass.
+    :param func: the function to evaluate.
+    :param inputs: the argument sequence to pass to `func`.
+    :param params: a sequence of parameters `func` depends on but does not
+                   explicitly take as arguments.
+    :param flag: if False, disable gradient checkpointing.
+    """
+    if flag:
+        args = tuple(inputs) + tuple(params)
+        return CheckpointFunction.apply(func, len(inputs), *args)
+    else:
+        return func(*inputs)
+
+
+class CheckpointFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, run_function, length, *args):
+        ctx.run_function = run_function
+        ctx.input_tensors = list(args[:length])
+        ctx.input_params = list(args[length:])
+
+        with torch.no_grad():
+            output_tensors = ctx.run_function(*ctx.input_tensors)
+        return output_tensors
+
+    @staticmethod
+    def backward(ctx, *output_grads):
+        ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
+        with torch.enable_grad():
+            # Fixes a bug where the first op in run_function modifies the
+            # Tensor storage in place, which is not allowed for detach()'d
+            # Tensors.
+            shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
+            output_tensors = ctx.run_function(*shallow_copies)
+        input_grads = torch.autograd.grad(
+            output_tensors,
+            ctx.input_tensors + ctx.input_params,
+            output_grads,
+            allow_unused=True,
+        )
+        del ctx.input_tensors
+        del ctx.input_params
+        del output_tensors
+        return (None, None) + input_grads
+
+
+def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
+    """
+    Create sinusoidal timestep embeddings.
+    :param timesteps: a 1-D Tensor of N indices, one per batch element.
+                      These may be fractional.
+    :param dim: the dimension of the output.
+    :param max_period: controls the minimum frequency of the embeddings.
+    :return: an [N x dim] Tensor of positional embeddings.
+    """
+    if not repeat_only:
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32)
+            / half
+        ).to(device=timesteps.device)
+        args = timesteps[:, None] * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
+    else:
+        embedding = repeat(timesteps, "b -> b d", d=dim)
+    # import pdb; pdb.set_trace()
+    return embedding
+
+
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+def conv_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def avg_pool_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D average pooling module.
+    """
+    if dims == 1:
+        return nn.AvgPool1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.AvgPool2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.AvgPool3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def default(val, d):
+    if val is not None:
+        return val
+    return d() if isfunction(d) else d
+
+
+class GEGLU(nn.Module):
+    def __init__(self, dim_in, dim_out):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim_out * 2)
+
+    def forward(self, x):
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        return x * F.gelu(gate)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, dim_out=None, mult=4, glu=False, dropout=0.0):
+        super().__init__()
+        inner_dim = int(dim * mult)
+        dim_out = default(dim_out, dim)
+        project_in = (
+            nn.Sequential(nn.Linear(dim, inner_dim), nn.GELU())
+            if not glu
+            else GEGLU(dim, inner_dim)
+        )
+
+        self.net = nn.Sequential(
+            project_in, nn.Dropout(dropout), nn.Linear(inner_dim, dim_out)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class MemoryEfficientCrossAttention(nn.Module):
+    # https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
+    def __init__(
+            self, 
+            query_dim, 
+            context_dim=None, 
+            heads=8, 
+            dim_head=64, 
+            dropout=0.0,
+            ip_dim=0,
+            ip_weight=1,
+        ):
+        super().__init__()
+        
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+
+        self.heads = heads
+        self.dim_head = dim_head
+
+        self.ip_dim = ip_dim
+        self.ip_weight = ip_weight
+
+        if self.ip_dim > 0:
+            self.to_k_ip = nn.Linear(context_dim, inner_dim, bias=False)
+            self.to_v_ip = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, query_dim), nn.Dropout(dropout)
+        )
+        self.attention_op: Optional[Any] = None
+
+    def forward(self, x, context=None):
+        q = self.to_q(x)
+        context = default(context, x)
+
+        if self.ip_dim > 0:
+            # context： [B, 77 + 16(ip), 1024]
+            token_len = context.shape[1]
+            context_ip = context[:, -self.ip_dim :, :]
+            k_ip = self.to_k_ip(context_ip)
+            v_ip = self.to_v_ip(context_ip)
+            context = context[:, : (token_len - self.ip_dim), :]
+
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        b, _, _ = q.shape
+        q, k, v = map(
+            lambda t: t.unsqueeze(3)
+            .reshape(b, t.shape[1], self.heads, self.dim_head)
+            .permute(0, 2, 1, 3)
+            .reshape(b * self.heads, t.shape[1], self.dim_head)
+            .contiguous(),
+            (q, k, v),
+        )
+
+        # actually compute the attention, what we cannot get enough of
+        out = xformers.ops.memory_efficient_attention(
+            q, k, v, attn_bias=None, op=self.attention_op
+        )
+
+        if self.ip_dim > 0:
+            k_ip, v_ip = map(
+                lambda t: t.unsqueeze(3)
+                .reshape(b, t.shape[1], self.heads, self.dim_head)
+                .permute(0, 2, 1, 3)
+                .reshape(b * self.heads, t.shape[1], self.dim_head)
+                .contiguous(),
+                (k_ip, v_ip),
+            )
+            # actually compute the attention, what we cannot get enough of
+            out_ip = xformers.ops.memory_efficient_attention(
+                q, k_ip, v_ip, attn_bias=None, op=self.attention_op
+            )
+            out = out + self.ip_weight * out_ip
+
+        out = (
+            out.unsqueeze(0)
+            .reshape(b, self.heads, out.shape[1], self.dim_head)
+            .permute(0, 2, 1, 3)
+            .reshape(b, out.shape[1], self.heads * self.dim_head)
+        )
+        return self.to_out(out)
+
+
+class BasicTransformerBlock3D(nn.Module):
+    
+    def __init__(
+        self,
+        dim,
+        n_heads,
+        d_head,
+        context_dim,
+        dropout=0.0,
+        gated_ff=True,
+        checkpoint=True,
+        ip_dim=0,
+        ip_weight=1,
+    ):
+        super().__init__()
+
+        self.attn1 = MemoryEfficientCrossAttention(
+            query_dim=dim,
+            context_dim=None, # self-attention
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+        )
+        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+        self.attn2 = MemoryEfficientCrossAttention(
+            query_dim=dim,
+            context_dim=context_dim,
+            heads=n_heads,
+            dim_head=d_head,
+            dropout=dropout,
+            # ip only applies to cross-attention
+            ip_dim=ip_dim,
+            ip_weight=ip_weight,
+        ) 
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.norm3 = nn.LayerNorm(dim)
+        self.checkpoint = checkpoint
+
+    def forward(self, x, context=None, num_frames=1):
+        return checkpoint(
+            self._forward, (x, context, num_frames), self.parameters(), self.checkpoint
+        )
+
+    def _forward(self, x, context=None, num_frames=1):
+        x = rearrange(x, "(b f) l c -> b (f l) c", f=num_frames).contiguous()
+        x = self.attn1(self.norm1(x), context=None) + x
+        x = rearrange(x, "b (f l) c -> (b f) l c", f=num_frames).contiguous()
+        x = self.attn2(self.norm2(x), context=context) + x
+        x = self.ff(self.norm3(x)) + x
+        return x
+
+
+class SpatialTransformer3D(nn.Module):
+
+    def __init__(
+        self,
+        in_channels,
+        n_heads,
+        d_head,
+        context_dim, # cross attention input dim
+        depth=1,
+        dropout=0.0,
+        ip_dim=0,
+        ip_weight=1,
+        use_checkpoint=True,
+    ):
+        super().__init__()
+
+        if not isinstance(context_dim, list):
+            context_dim = [context_dim]
+
+        self.in_channels = in_channels
+
+        inner_dim = n_heads * d_head
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
+        self.proj_in = nn.Linear(in_channels, inner_dim)
+
+        self.transformer_blocks = nn.ModuleList(
+            [
+                BasicTransformerBlock3D(
+                    inner_dim,
+                    n_heads,
+                    d_head,
+                    context_dim=context_dim[d],
+                    dropout=dropout,
+                    checkpoint=use_checkpoint,
+                    ip_dim=ip_dim,
+                    ip_weight=ip_weight,
+                )
+                for d in range(depth)
+            ]
+        )
+        
+        self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
+        
+
+    def forward(self, x, context=None, num_frames=1):
+        # note: if no context is given, cross-attention defaults to self-attention
+        if not isinstance(context, list):
+            context = [context]
+        b, c, h, w = x.shape
+        x_in = x
+        x = self.norm(x)
+        x = rearrange(x, "b c h w -> b (h w) c").contiguous()
+        x = self.proj_in(x)
+        for i, block in enumerate(self.transformer_blocks):
+            x = block(x, context=context[i], num_frames=num_frames)
+        x = self.proj_out(x)
+        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
+        
+        return x + x_in
+
+
+class PerceiverAttention(nn.Module):
+    def __init__(self, *, dim, dim_head=64, heads=8):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.dim_head = dim_head
+        self.heads = heads
+        inner_dim = dim_head * heads
+
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(dim, inner_dim * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+    def forward(self, x, latents):
+        """
+        Args:
+            x (torch.Tensor): image features
+                shape (b, n1, D)
+            latent (torch.Tensor): latent features
+                shape (b, n2, D)
+        """
+        x = self.norm1(x)
+        latents = self.norm2(latents)
+
+        b, l, _ = latents.shape
+
+        q = self.to_q(latents)
+        kv_input = torch.cat((x, latents), dim=-2)
+        k, v = self.to_kv(kv_input).chunk(2, dim=-1)
+
+        q, k, v = map(
+            lambda t: t.reshape(b, t.shape[1], self.heads, -1)
+            .transpose(1, 2)
+            .reshape(b, self.heads, t.shape[1], -1)
+            .contiguous(),
+            (q, k, v),
+        )
+
+        # attention
+        scale = 1 / math.sqrt(math.sqrt(self.dim_head))
+        weight = (q * scale) @ (k * scale).transpose(-2, -1)  # More stable with f16 than dividing afterwards
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        out = weight @ v
+
+        out = out.permute(0, 2, 1, 3).reshape(b, l, -1)
+
+        return self.to_out(out)
+
+
+class Resampler(nn.Module):
+    def __init__(
+        self,
+        dim=1024,
+        depth=8,
+        dim_head=64,
+        heads=16,
+        num_queries=8,
+        embedding_dim=768,
+        output_dim=1024,
+        ff_mult=4,
+    ):
+        super().__init__()
+        self.latents = nn.Parameter(torch.randn(1, num_queries, dim) / dim ** 0.5)
+        self.proj_in = nn.Linear(embedding_dim, dim)
+        self.proj_out = nn.Linear(dim, output_dim)
+        self.norm_out = nn.LayerNorm(output_dim)
+
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(
+                nn.ModuleList(
+                    [
+                        PerceiverAttention(dim=dim, dim_head=dim_head, heads=heads),
+                        nn.Sequential(
+                            nn.LayerNorm(dim),
+                            nn.Linear(dim, dim * ff_mult, bias=False),
+                            nn.GELU(),
+                            nn.Linear(dim * ff_mult, dim, bias=False),
+                        )
+                    ]
+                )
+            )
+
+    def forward(self, x):
+        latents = self.latents.repeat(x.size(0), 1, 1)
+        x = self.proj_in(x)
+        for attn, ff in self.layers:
+            latents = attn(x, latents) + latents
+            latents = ff(latents) + latents
+
+        latents = self.proj_out(latents)
+        return self.norm_out(latents)
+
 
 class CondSequential(nn.Sequential):
     """
