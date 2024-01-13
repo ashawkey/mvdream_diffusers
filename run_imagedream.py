@@ -5,8 +5,8 @@ import argparse
 from pipeline_mvdream import MVDreamPipeline
 
 pipe = MVDreamPipeline.from_pretrained(
-    "./weights_imagedream", # local weights
-    # "ashawkey/mvdream-sd2.1-diffusers",
+    # "./weights_imagedream", # local weights
+    "ashawkey/imagedream-ipmv-diffusers", # remote weights
     torch_dtype=torch.float16,
     trust_remote_code=True,
 )

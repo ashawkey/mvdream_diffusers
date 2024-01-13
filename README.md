@@ -2,19 +2,22 @@
 
 A **unified** diffusers implementation of [MVDream](https://github.com/bytedance/MVDream) and [ImageDream](https://github.com/bytedance/ImageDream).
 
-We provide converted `fp16` weights on [huggingface](TODO).
+We provide converted `fp16` weights on huggingface:
+* [MVDream](https://huggingface.co/ashawkey/mvdream-sd2.1-diffusers)
+* [ImageDream](https://huggingface.co/ashawkey/imagedream-ipmv-diffusers)
+
+
+### Install
+```bash
+# dependency
+pip install -r requirements.txt
+```
 
 ### Usage
 
 ```bash
 python run_mvdream.py "a cute owl"
 python run_imagedream.py data/anya_rgba.png
-```
-
-### Install
-```bash
-# dependency
-pip install -r requirements.txt
 ```
 
 ### Convert weights
