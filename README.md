@@ -26,9 +26,9 @@ detailed usage:
 ```python
 import torch
 import kiui
-from mvdream.pipeline_mvdream import MVDreamStableDiffusionPipeline
+from mvdream.pipeline_mvdream import MVDreamPipeline
 
-pipe = MVDreamStableDiffusionPipeline.from_pretrained('./weights', torch_dtype=torch.float16)
+pipe = MVDreamPipeline.from_pretrained('./weights', torch_dtype=torch.float16)
 pipe = pipe.to("cuda")
 
 prompt = "a photo of an astronaut riding a horse on mars"

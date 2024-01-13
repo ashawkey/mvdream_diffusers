@@ -74,7 +74,7 @@ def get_camera(
     return torch.tensor(np.stack(cameras, 0)).float()
 
 
-class MVDreamStableDiffusionPipeline(DiffusionPipeline):
+class MVDreamPipeline(DiffusionPipeline):
     def __init__(
         self,
         vae: AutoencoderKL,

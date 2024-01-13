@@ -16,7 +16,7 @@ from typing import Any
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 from mvdream.models import MultiViewUNetModel
-from mvdream.pipeline_mvdream import MVDreamStableDiffusionPipeline
+from mvdream.pipeline_mvdream import MVDreamPipeline
 from transformers import CLIPTokenizer, CLIPTextModel
 
 logger = logging.get_logger(__name__)
@@ -460,7 +460,7 @@ def convert_from_original_mvdream_ckpt(checkpoint_path, original_config_file, de
             f"Unknown context_dim: {original_config.model.paams.unet_config.params.context_dim}"
         )
 
-    pipe = MVDreamStableDiffusionPipeline(
+    pipe = MVDreamPipeline(
         vae=vae,
         unet=unet,
         tokenizer=tokenizer,
@@ -547,7 +547,7 @@ if __name__ == "__main__":
                 image.save(f"image_{i}.png")  # type: ignore
 
             print(f"Testing entire pipeline...")
-            loaded_pipe: MVDreamStableDiffusionPipeline = MVDreamStableDiffusionPipeline.from_pretrained(args.dump_path, safe_serialization=args.to_safetensors)  # type: ignore
+            loaded_pipe: MVDreamPipeline = MVDreamPipeline.from_pretrained(args.dump_path, safe_serialization=args.to_safetensors)  # type: ignore
             images = loaded_pipe(
                 prompt="Head of Hatsune Miku",
                 negative_prompt="painting, bad quality, flat",

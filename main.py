@@ -2,9 +2,9 @@ import torch
 import kiui
 import numpy as np
 import argparse
-from mvdream.pipeline_mvdream import MVDreamStableDiffusionPipeline
+from mvdream.pipeline_mvdream import MVDreamPipeline
 
-pipe = MVDreamStableDiffusionPipeline.from_pretrained(
+pipe = MVDreamPipeline.from_pretrained(
     "./weights", # local weights
     # "ashawkey/mvdream-sd2.1-diffusers",
     torch_dtype=torch.float16
