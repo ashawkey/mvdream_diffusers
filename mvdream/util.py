@@ -1,7 +1,31 @@
 import math
 import torch
 import torch.nn as nn
+import numpy as np
 from einops import repeat
+
+from kiui.cam import orbit_camera
+
+def get_camera(
+    num_frames, elevation=15, azimuth_start=0, azimuth_span=360, blender_coord=True, extra_view=False,
+):
+    angle_gap = azimuth_span / num_frames
+    cameras = []
+    for azimuth in np.arange(azimuth_start, azimuth_span + azimuth_start, angle_gap):
+        
+        pose = orbit_camera(-elevation, azimuth, radius=1) # kiui's elevation is negated, [4, 4]
+
+        # opengl to blender
+        if blender_coord:
+            pose[2] *= -1
+            pose[[1, 2]] = pose[[2, 1]]
+
+        cameras.append(pose.flatten())
+
+    if extra_view:
+        cameras.append(np.zeros_like(cameras[0]))
+
+    return torch.from_numpy(np.stack(cameras, axis=0)).float() # [num_frames, 16]
 
 
 def checkpoint(func, inputs, params, flag):

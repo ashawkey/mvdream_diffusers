@@ -5,19 +5,21 @@ import argparse
 from mvdream.pipeline_mvdream import MVDreamPipeline
 
 pipe = MVDreamPipeline.from_pretrained(
-    "./weights", # local weights
+    "./weights_imagedream", # local weights
     # "ashawkey/mvdream-sd2.1-diffusers",
     torch_dtype=torch.float16
 )
 pipe = pipe.to("cuda")
 
 
-parser = argparse.ArgumentParser(description="MVDream")
-parser.add_argument("prompt", type=str, default="a cute owl 3d model")
+parser = argparse.ArgumentParser(description="ImageDream")
+parser.add_argument("image", type=str, default='data/anya_rgba.png')
+parser.add_argument("--prompt", type=str, default="")
 args = parser.parse_args()
 
 while True:
-    image = pipe(args.prompt)
+    input_image = kiui.read_image(args.image, mode='float')
+    image = pipe(args.prompt, input_image)
     grid = np.concatenate(
         [
             np.concatenate([image[0], image[2]], axis=0),
@@ -25,4 +27,6 @@ while True:
         ],
         axis=1,
     )
-    kiui.vis.plot_image(grid)
+    # kiui.vis.plot_image(grid)
+    kiui.write_image('test_imagedream.jpg', grid)
+    break

@@ -17,7 +17,9 @@ from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 from mvdream.models import MultiViewUNetModel
 from mvdream.pipeline_mvdream import MVDreamPipeline
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModel, CLIPImageProcessor
+
+import kiui
 
 logger = logging.get_logger(__name__)
 
@@ -101,12 +103,20 @@ def shave_segments(path, n_shave_prefix_segments=1):
         return ".".join(path.split(".")[:n_shave_prefix_segments])
 
 
-def create_vae_diffusers_config(original_config, image_size: int):
+def create_vae_diffusers_config(original_config, image_size):
     """
     Creates a config for the diffusers based on the config of the LDM model.
     """
-    vae_params = original_config.model.params.first_stage_config.params.ddconfig
-    _ = original_config.model.params.first_stage_config.params.embed_dim
+
+    
+    if 'imagedream' in original_config.model.target:
+        vae_params = original_config.model.params.vae_config.params.ddconfig
+        _ = original_config.model.params.vae_config.params.embed_dim
+        vae_key = "vae_model."
+    else:
+        vae_params = original_config.model.params.first_stage_config.params.ddconfig
+        _ = original_config.model.params.first_stage_config.params.embed_dim
+        vae_key = "first_stage_model."
 
     block_out_channels = [vae_params.ch * mult for mult in vae_params.ch_mult]
     down_block_types = ["DownEncoderBlock2D"] * len(block_out_channels)
@@ -122,13 +132,12 @@ def create_vae_diffusers_config(original_config, image_size: int):
         "latent_channels": vae_params.z_channels,
         "layers_per_block": vae_params.num_res_blocks,
     }
-    return config
+    return config, vae_key
 
 
-def convert_ldm_vae_checkpoint(checkpoint, config):
+def convert_ldm_vae_checkpoint(checkpoint, config, vae_key):
     # extract state dict for VAE
     vae_state_dict = {}
-    vae_key = "first_stage_model."
     keys = list(checkpoint.keys())
     for key in keys:
         if key.startswith(vae_key):
@@ -394,22 +403,15 @@ def convert_from_original_mvdream_ckpt(checkpoint_path, original_config_file, de
     )
     scheduler.register_to_config(clip_sample=False)
 
-    # Convert the UNet2DConditionModel model.
-    # upcast_attention = None
-    # unet_config = create_unet_diffusers_config(original_config, image_size=image_size)
-    # unet_config["upcast_attention"] = upcast_attention
-    # with init_empty_weights():
-    #     unet = UNet2DConditionModel(**unet_config)
-    # converted_unet_checkpoint = convert_ldm_unet_checkpoint(
-    #     checkpoint, unet_config, path=None, extract_ema=extract_ema
-    # )
-    # print(f"Unet Config: {original_config.model.params.unet_config.params}")
     unet_config = create_unet_config(original_config)
 
     # remove unused configs
-    del unet_config['legacy']
-    del unet_config['use_linear_in_transformer']
-    del unet_config['use_spatial_transformer']
+    unet_config.pop('legacy', None)
+    unet_config.pop('use_linear_in_transformer', None)
+    unet_config.pop('use_spatial_transformer', None)
+    
+    unet_config.pop('ip_mode', None)
+    unet_config.pop('with_ip', None)
 
     unet = MultiViewUNetModel(**unet_config)
     unet.register_to_config(**unet_config)
@@ -425,8 +427,8 @@ def convert_from_original_mvdream_ckpt(checkpoint_path, original_config_file, de
         set_module_tensor_to_device(unet, param_name, device=device, value=param)
 
     # Convert the VAE model.
-    vae_config = create_vae_diffusers_config(original_config, image_size=image_size)
-    converted_vae_checkpoint = convert_ldm_vae_checkpoint(checkpoint, vae_config)
+    vae_config, vae_key = create_vae_diffusers_config(original_config, image_size=image_size)
+    converted_vae_checkpoint = convert_ldm_vae_checkpoint(checkpoint, vae_config, vae_key)
 
     if (
         "model" in original_config
@@ -445,20 +447,17 @@ def convert_from_original_mvdream_ckpt(checkpoint_path, original_config_file, de
     for param_name, param in converted_vae_checkpoint.items():
         set_module_tensor_to_device(vae, param_name, device=device, value=param)
 
-    if original_config.model.params.unet_config.params.context_dim == 768:
-        tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(
-            "openai/clip-vit-large-patch14"
-        )
-        text_encoder: CLIPTextModel = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14").to(device=device)  # type: ignore
-    elif original_config.model.params.unet_config.params.context_dim == 1024:
-        tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(
-            "stabilityai/stable-diffusion-2-1", subfolder="tokenizer"
-        )
-        text_encoder: CLIPTextModel = CLIPTextModel.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="text_encoder").to(device=device)  # type: ignore
+    # we only supports SD 2.1 based model
+    tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="tokenizer")
+    text_encoder: CLIPTextModel = CLIPTextModel.from_pretrained("stabilityai/stable-diffusion-2-1", subfolder="text_encoder").to(device=device)  # type: ignore
+    
+    # imagedream variant
+    if unet.ip_dim > 0:
+        feature_extractor: CLIPImageProcessor = CLIPImageProcessor.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+        image_encoder: CLIPVisionModel = CLIPVisionModel.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
     else:
-        raise ValueError(
-            f"Unknown context_dim: {original_config.model.paams.unet_config.params.context_dim}"
-        )
+        feature_extractor = None
+        image_encoder = None
 
     pipe = MVDreamPipeline(
         vae=vae,
@@ -466,6 +465,8 @@ def convert_from_original_mvdream_ckpt(checkpoint_path, original_config_file, de
         tokenizer=tokenizer,
         text_encoder=text_encoder,
         scheduler=scheduler,
+        feature_extractor=feature_extractor,
+        image_encoder=image_encoder,
     )
 
     return pipe
@@ -534,31 +535,63 @@ if __name__ == "__main__":
 
     if args.test:
         try:
-            print(f"Testing each subcomponent of the pipeline...")
-            images = pipe(
-                prompt="Head of Hatsune Miku",
-                negative_prompt="painting, bad quality, flat",
-                output_type="pil",
-                guidance_scale=7.5,
-                num_inference_steps=50,
-                device=args.device,
-            )
-            for i, image in enumerate(images):
-                image.save(f"image_{i}.png")  # type: ignore
+            # mvdream
+            if pipe.unet.ip_dim == 0:
+                print(f"Testing each subcomponent of the pipeline...")
+                images = pipe(
+                    prompt="Head of Hatsune Miku",
+                    negative_prompt="painting, bad quality, flat",
+                    output_type="pil",
+                    guidance_scale=7.5,
+                    num_inference_steps=50,
+                    device=args.device,
+                )
+                for i, image in enumerate(images):
+                    image.save(f"test_image_{i}.png")  # type: ignore
 
-            print(f"Testing entire pipeline...")
-            loaded_pipe: MVDreamPipeline = MVDreamPipeline.from_pretrained(args.dump_path, safe_serialization=args.to_safetensors)  # type: ignore
-            images = loaded_pipe(
-                prompt="Head of Hatsune Miku",
-                negative_prompt="painting, bad quality, flat",
-                output_type="pil",
-                guidance_scale=7.5,
-                num_inference_steps=50,
-                device=args.device,
-            )
-            for i, image in enumerate(images):
-                image.save(f"image_{i}.png")  # type: ignore
+                print(f"Testing entire pipeline...")
+                loaded_pipe = MVDreamPipeline.from_pretrained(args.dump_path)  # type: ignore
+                images = loaded_pipe(
+                    prompt="Head of Hatsune Miku",
+                    negative_prompt="painting, bad quality, flat",
+                    output_type="pil",
+                    guidance_scale=7.5,
+                    num_inference_steps=50,
+                    device=args.device,
+                )
+                for i, image in enumerate(images):
+                    image.save(f"test_image_{i}.png")  # type: ignore
+            # imagedream
+            else:
+                input_image = kiui.read_image('data/anya_rgba.png', mode='float')
+                print(f"Testing each subcomponent of the pipeline...")
+                images = pipe(
+                    image=input_image,
+                    prompt="",
+                    negative_prompt="painting, bad quality, flat",
+                    output_type="pil",
+                    guidance_scale=5.0,
+                    num_inference_steps=50,
+                    device=args.device,
+                )
+                for i, image in enumerate(images):
+                    image.save(f"test_image_{i}.png")  # type: ignore
+
+                print(f"Testing entire pipeline...")
+                loaded_pipe = MVDreamPipeline.from_pretrained(args.dump_path)  # type: ignore
+                images = loaded_pipe(
+                    image=input_image,
+                    prompt="",
+                    negative_prompt="painting, bad quality, flat",
+                    output_type="pil",
+                    guidance_scale=5.0,
+                    num_inference_steps=50,
+                    device=args.device,
+                )
+                for i, image in enumerate(images):
+                    image.save(f"test_image_{i}.png")  # type: ignore
+                
+
+            print("Inference test passed!")
         except Exception as e:
             print(f"Failed to test inference: {e}")
-            raise e from e
-        print("Inference test passed!")

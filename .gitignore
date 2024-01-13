@@ -3,6 +3,6 @@
 **/__pycache__
 *.pyc
 
-weights
+weights*
 models
 sd-v2*

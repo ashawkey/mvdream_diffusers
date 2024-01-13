@@ -13,8 +13,10 @@ from .util import (
     zero_module,
     timestep_embedding,
 )
-from .attention import SpatialTransformer, SpatialTransformer3D
+from .attention import SpatialTransformer3D
+from .adaptor import Resampler, ImageProjModel
 
+import kiui
 
 class CondSequential(nn.Sequential):
     """
@@ -28,8 +30,6 @@ class CondSequential(nn.Sequential):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer3D):
                 x = layer(x, context, num_frames=num_frames)
-            elif isinstance(layer, SpatialTransformer):
-                x = layer(x, context)
             else:
                 x = layer(x)
         return x
@@ -274,6 +274,8 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         disable_middle_self_attn=False,
         adm_in_channels=None,
         camera_dim=None,
+        ip_dim=0,
+        ip_weight=1.0,
         **kwargs,
     ):
         super().__init__()
@@ -305,9 +307,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                     "as a list/tuple (per-level) with the same length as channel_mult"
                 )
             self.num_res_blocks = num_res_blocks
-        if disable_self_attentions is not None:
-            # should be a list of booleans, indicating whether to disable self-attention in TransformerBlocks or not
-            assert len(disable_self_attentions) == len(channel_mult)
+        
         if num_attention_blocks is not None:
             assert len(num_attention_blocks) == len(self.num_res_blocks)
             assert all(
@@ -333,6 +333,21 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.predict_codebook_ids = n_embed is not None
+
+        self.ip_dim = ip_dim
+        self.ip_weight = ip_weight
+
+        if self.ip_dim > 0:
+            self.image_embed = Resampler(
+                dim=context_dim,
+                depth=4,
+                dim_head=64,
+                heads=12,
+                num_queries=ip_dim,  # num token
+                embedding_dim=1280,
+                output_dim=context_dim,
+                ff_mult=4,
+            )
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -398,11 +413,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                     else:
                         num_heads = ch // num_head_channels
                         dim_head = num_head_channels
-                    
-                    if disable_self_attentions is not None:
-                        disabled_sa = disable_self_attentions[level]
-                    else:
-                        disabled_sa = False
 
                     if num_attention_blocks is None or nr < num_attention_blocks[level]:
                         layers.append(
@@ -410,10 +420,11 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                                 ch,
                                 num_heads,
                                 dim_head,
-                                depth=transformer_depth,
                                 context_dim=context_dim,
-                                disable_self_attn=disabled_sa,
+                                depth=transformer_depth,
                                 use_checkpoint=use_checkpoint,
+                                ip_dim=self.ip_dim,
+                                ip_weight=self.ip_weight,
                             )
                         )
                 self.input_blocks.append(CondSequential(*layers))
@@ -463,10 +474,11 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                 ch,
                 num_heads,
                 dim_head,
-                depth=transformer_depth,
                 context_dim=context_dim,
-                disable_self_attn=disable_middle_self_attn,
+                depth=transformer_depth,
                 use_checkpoint=use_checkpoint,
+                ip_dim=self.ip_dim,
+                ip_weight=self.ip_weight,
             ), 
             ResBlock(
                 ch,
@@ -501,11 +513,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                     else:
                         num_heads = ch // num_head_channels
                         dim_head = num_head_channels
-                    
-                    if disable_self_attentions is not None:
-                        disabled_sa = disable_self_attentions[level]
-                    else:
-                        disabled_sa = False
 
                     if num_attention_blocks is None or i < num_attention_blocks[level]:
                         layers.append(
@@ -513,10 +520,11 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                                 ch,
                                 num_heads,
                                 dim_head,
-                                depth=transformer_depth,
                                 context_dim=context_dim,
-                                disable_self_attn=disabled_sa,
+                                depth=transformer_depth,
                                 use_checkpoint=use_checkpoint,
+                                ip_dim=self.ip_dim,
+                                ip_weight=self.ip_weight,
                             )
                         )
                 if level and i == self.num_res_blocks[level]:
@@ -556,9 +564,11 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         x,
         timesteps=None,
         context=None,
-        y: Optional[Tensor] = None,
+        y=None,
         camera=None,
         num_frames=1,
+        ip=None,
+        ip_img=None,
         **kwargs,
     ):
         """
@@ -572,14 +582,14 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         """
         assert (
             x.shape[0] % num_frames == 0
-        ), "[UNet] input batch size must be dividable by num_frames!"
+        ), "input batch size must be dividable by num_frames!"
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
+
         hs = []
-        t_emb = timestep_embedding(
-            timesteps, self.model_channels, repeat_only=False
-        ).to(x.dtype)
+
+        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False).to(x.dtype)
 
         emb = self.time_embed(t_emb)
 
@@ -590,8 +600,13 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
 
         # Add camera embeddings
         if camera is not None:
-            assert camera.shape[0] == emb.shape[0]
             emb = emb + self.camera_embed(camera)
+        
+        # imagedream variant
+        if self.ip_dim > 0:
+            x[(num_frames - 1) :: num_frames, :, :, :] = ip_img
+            ip_emb = self.image_embed(ip)
+            context = torch.cat((context, ip_emb), 1)
 
         h = x
         for module in self.input_blocks:

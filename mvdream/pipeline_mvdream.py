@@ -1,8 +1,9 @@
 import torch
+import torch.nn.functional as F
 import inspect
 import numpy as np
 from typing import Callable, List, Optional, Union
-from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModel, CLIPImageProcessor
 from diffusers import AutoencoderKL, DiffusionPipeline
 from diffusers.utils import (
     deprecate,
@@ -15,66 +16,17 @@ from diffusers.schedulers import DDIMScheduler
 from diffusers.utils.torch_utils import randn_tensor
 
 from .models import MultiViewUNetModel
+from .util import get_camera
+
+import kiui
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-def create_camera_to_world_matrix(elevation, azimuth):
-    elevation = np.radians(elevation)
-    azimuth = np.radians(azimuth)
-    # Convert elevation and azimuth angles to Cartesian coordinates on a unit sphere
-    x = np.cos(elevation) * np.sin(azimuth)
-    y = np.sin(elevation)
-    z = np.cos(elevation) * np.cos(azimuth)
-
-    # Calculate camera position, target, and up vectors
-    camera_pos = np.array([x, y, z])
-    target = np.array([0, 0, 0])
-    up = np.array([0, 1, 0])
-
-    # Construct view matrix
-    forward = target - camera_pos
-    forward /= np.linalg.norm(forward)
-    right = np.cross(forward, up)
-    right /= np.linalg.norm(right)
-    new_up = np.cross(right, forward)
-    new_up /= np.linalg.norm(new_up)
-    cam2world = np.eye(4)
-    cam2world[:3, :3] = np.array([right, new_up, -forward]).T
-    cam2world[:3, 3] = camera_pos
-    return cam2world
-
-
-def convert_opengl_to_blender(camera_matrix):
-    if isinstance(camera_matrix, np.ndarray):
-        # Construct transformation matrix to convert from OpenGL space to Blender space
-        flip_yz = np.array([[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]])
-        camera_matrix_blender = np.dot(flip_yz, camera_matrix)
-    else:
-        # Construct transformation matrix to convert from OpenGL space to Blender space
-        flip_yz = torch.tensor(
-            [[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]]
-        )
-        if camera_matrix.ndim == 3:
-            flip_yz = flip_yz.unsqueeze(0)
-        camera_matrix_blender = torch.matmul(flip_yz.to(camera_matrix), camera_matrix)
-    return camera_matrix_blender
-
-
-def get_camera(
-    num_frames, elevation=15, azimuth_start=0, azimuth_span=360, blender_coord=True
-):
-    angle_gap = azimuth_span / num_frames
-    cameras = []
-    for azimuth in np.arange(azimuth_start, azimuth_span + azimuth_start, angle_gap):
-        camera_matrix = create_camera_to_world_matrix(elevation, azimuth)
-        if blender_coord:
-            camera_matrix = convert_opengl_to_blender(camera_matrix)
-        cameras.append(camera_matrix.flatten())
-    return torch.tensor(np.stack(cameras, 0)).float()
-
-
 class MVDreamPipeline(DiffusionPipeline):
+
+    _optional_components = ["feature_extractor", "image_encoder"]
+
     def __init__(
         self,
         vae: AutoencoderKL,
@@ -82,6 +34,9 @@ class MVDreamPipeline(DiffusionPipeline):
         tokenizer: CLIPTokenizer,
         text_encoder: CLIPTextModel,
         scheduler: DDIMScheduler,
+        # imagedream variant
+        feature_extractor: CLIPImageProcessor,
+        image_encoder: CLIPVisionModel,
         requires_safety_checker: bool = False,
     ):
         super().__init__()
@@ -123,6 +78,8 @@ class MVDreamPipeline(DiffusionPipeline):
             scheduler=scheduler,
             tokenizer=tokenizer,
             text_encoder=text_encoder,
+            feature_extractor=feature_extractor,
+            image_encoder=image_encoder,
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
@@ -445,10 +402,42 @@ class MVDreamPipeline(DiffusionPipeline):
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
+    def encode_image(self, image, device, num_images_per_prompt):
+        dtype = next(self.image_encoder.parameters()).dtype
+
+        image = (image * 255).astype(np.uint8)
+        image = self.feature_extractor(image, return_tensors="pt").pixel_values
+        
+        image = image.to(device=device, dtype=dtype)
+        
+        image_enc_hidden_states = self.image_encoder(image, output_hidden_states=True).hidden_states[-2]
+        image_enc_hidden_states = image_enc_hidden_states.repeat_interleave(num_images_per_prompt, dim=0)
+
+        # imagedream directly use zero as uncond image embeddings
+        uncond_image_enc_hidden_states = torch.zeros_like(image_enc_hidden_states)
+
+        return uncond_image_enc_hidden_states, image_enc_hidden_states
+
+    def encode_image_latents(self, image, device, num_images_per_prompt):
+        
+        image = torch.from_numpy(image).unsqueeze(0).permute(0, 3, 1, 2) # [1, 3, H, W]
+        image = image.to(device=device)
+        image = F.interpolate(image, (256, 256), mode='bilinear', align_corners=False)
+        dtype = next(self.image_encoder.parameters()).dtype
+        image = image.to(dtype=dtype)
+
+        posterior = self.vae.encode(image).latent_dist
+
+        latents = posterior.sample() * self.vae.config.scaling_factor # [B, C, H, W]
+        latents = latents.repeat_interleave(num_images_per_prompt, dim=0)
+
+        return torch.zeros_like(latents), latents
+
     @torch.no_grad()
     def __call__(
         self,
         prompt: str = "a car",
+        image: Optional[np.ndarray] = None,
         height: int = 256,
         width: int = 256,
         num_inference_steps: int = 50,
@@ -457,10 +446,10 @@ class MVDreamPipeline(DiffusionPipeline):
         num_images_per_prompt: int = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        output_type: Optional[str] = "image",
+        output_type: Optional[str] = "numpy", # pil, numpy, latents
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
-        batch_size: int = 4,
+        num_frames: int = 4,
         device=torch.device("cuda:0"),
     ):
         self.unet = self.unet.to(device=device)
@@ -477,7 +466,15 @@ class MVDreamPipeline(DiffusionPipeline):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        _prompt_embeds: torch.Tensor = self._encode_prompt(
+        # imagedream variant (TODO: debug)
+        if image is not None:
+            assert isinstance(image, np.ndarray) and image.dtype == np.float32
+
+            self.image_encoder = self.image_encoder.to(device=device)
+            image_embeds_neg, image_embeds_pos = self.encode_image(image, device, num_images_per_prompt)
+            image_latents_neg, image_latents_pos = self.encode_image_latents(image, device, num_images_per_prompt)
+            
+        _prompt_embeds = self._encode_prompt(
             prompt=prompt,
             device=device,
             num_images_per_prompt=num_images_per_prompt,
@@ -487,8 +484,9 @@ class MVDreamPipeline(DiffusionPipeline):
         prompt_embeds_neg, prompt_embeds_pos = _prompt_embeds.chunk(2)
 
         # Prepare latent variables
+        actual_num_frames = num_frames if image is None else num_frames + 1
         latents: torch.Tensor = self.prepare_latents(
-            batch_size * num_images_per_prompt,
+            actual_num_frames * num_images_per_prompt,
             4,
             height,
             width,
@@ -498,9 +496,9 @@ class MVDreamPipeline(DiffusionPipeline):
             None,
         )
 
-        camera = get_camera(batch_size).to(dtype=latents.dtype, device=device)
+        camera = get_camera(num_frames, extra_view=(actual_num_frames != num_frames)).to(dtype=latents.dtype, device=device)
 
-        # Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # Denoising loop
@@ -514,20 +512,21 @@ class MVDreamPipeline(DiffusionPipeline):
                     latent_model_input, t
                 )
 
+
+                unet_inputs = {
+                    'x': latent_model_input,
+                    'timesteps': torch.tensor([t] * actual_num_frames * multiplier, dtype=latent_model_input.dtype, device=device),
+                    'context': torch.cat([prompt_embeds_neg] * actual_num_frames + [prompt_embeds_pos] * actual_num_frames),
+                    'num_frames': actual_num_frames,
+                    'camera': torch.cat([camera] * multiplier),
+                }
+
+                if image is not None:
+                    unet_inputs['ip'] = torch.cat([image_embeds_neg] * actual_num_frames + [image_embeds_pos] * actual_num_frames)
+                    unet_inputs['ip_img'] = torch.cat([image_latents_neg] + [image_latents_pos]) # no repeat
+                
                 # predict the noise residual
-                noise_pred = self.unet.forward(
-                    x=latent_model_input,
-                    timesteps=torch.tensor(
-                        [t] * 4 * multiplier,
-                        dtype=latent_model_input.dtype,
-                        device=device,
-                    ),
-                    context=torch.cat(
-                        [prompt_embeds_neg] * 4 + [prompt_embeds_pos] * 4
-                    ),
-                    num_frames=4,
-                    camera=torch.cat([camera] * multiplier),
-                )
+                noise_pred = self.unet.forward(**unet_inputs)
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -537,7 +536,6 @@ class MVDreamPipeline(DiffusionPipeline):
                     )
 
                 # compute the previous noisy sample x_t -> x_t-1
-                # latents = self.scheduler.step(noise_pred.to(dtype=torch.float32), t, latents.to(dtype=torch.float32)).prev_sample.to(prompt_embeds.dtype)
                 latents: torch.Tensor = self.scheduler.step(
                     noise_pred, t, latents, **extra_step_kwargs, return_dict=False
                 )[0]
@@ -556,7 +554,7 @@ class MVDreamPipeline(DiffusionPipeline):
         elif output_type == "pil":
             image = self.decode_latents(latents)
             image = self.numpy_to_pil(image)
-        else:
+        else: # numpy
             image = self.decode_latents(latents)
 
         # Offload last model to CPU
