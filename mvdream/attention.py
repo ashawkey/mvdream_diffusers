@@ -88,7 +88,7 @@ class MemoryEfficientCrossAttention(nn.Module):
         context = default(context, x)
 
         if self.ip_dim > 0:
-            # context dim [(b frame_num), (77 + img_token), 1024]
+            # context： [B, 77 + 16(ip), 1024]
             token_len = context.shape[1]
             context_ip = context[:, -self.ip_dim :, :]
             k_ip = self.to_k_ip(context_ip)
@@ -212,9 +212,7 @@ class SpatialTransformer3D(nn.Module):
         self.in_channels = in_channels
 
         inner_dim = n_heads * d_head
-        self.norm = nn.GroupNorm(
-            num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
-        )
+        self.norm = nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
         self.proj_in = nn.Linear(in_channels, inner_dim)
 
         self.transformer_blocks = nn.ModuleList(

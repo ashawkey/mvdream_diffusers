@@ -1,15 +1,27 @@
-# MVDream-hf
+# MVDream-diffusers
 
-modified from https://github.com/KokeCacao/mvdream-hf.
+A **unified** diffusers implementation of [MVDream](https://github.com/bytedance/MVDream) and [ImageDream](https://github.com/bytedance/ImageDream).
 
-### convert weights
+We provide converted `fp16` weights on [huggingface](TODO).
+
+### Usage
+
+```bash
+python run_mvdream.py "a cute owl"
+python run_imagedream.py data/anya_rgba.png
+```
+
+### Install
+```bash
+# dependency
+pip install -r requirements.txt
+```
+
+### Convert weights
 
 MVDream:
 ```bash
-# dependency
-pip install -U omegaconf diffusers safetensors huggingface_hub transformers accelerate
-
-# download original ckpt
+# download original ckpt (we only support the SD 2.1 version)
 cd models
 wget https://huggingface.co/MVDream/MVDream/resolve/main/sd-v2.1-base-4view.pt
 wget https://raw.githubusercontent.com/bytedance/MVDream/main/mvdream/configs/sd-v2-base.yaml
@@ -21,18 +33,31 @@ python convert_mvdream_to_diffusers.py --checkpoint_path models/sd-v2.1-base-4vi
 
 ImageDream:
 ```bash
-# download original ckpt
-wget https://huggingface.co/Peng-Wang/ImageDream/resolve/main/sd-v2.1-base-4view-ipmv-local.pt
-wget https://raw.githubusercontent.com/bytedance/ImageDream/main/extern/ImageDream/imagedream/configs/sd_v2_base_ipmv_local.yaml
+# download original ckpt (we only support the pixel-controller version)
+cd models
+wget https://huggingface.co/Peng-Wang/ImageDream/resolve/main/sd-v2.1-base-4view-ipmv.pt
+wget https://raw.githubusercontent.com/bytedance/ImageDream/main/extern/ImageDream/imagedream/configs/sd_v2_base_ipmv.yaml
+cd ..
 
 # convert
-python convert_mvdream_to_diffusers.py --checkpoint_path models/sd-v2.1-base-4view-ipmv-local.pt --dump_path ./weights_imagedream --original_config_file models/sd_v2_base_ipmv_local.yaml --half --to_safetensors --test
+python convert_mvdream_to_diffusers.py --checkpoint_path models/sd-v2.1-base-4view-ipmv.pt --dump_path ./weights_imagedream --original_config_file models/sd_v2_base_ipmv.yaml --half --to_safetensors --test
 ```
 
-### usage
+### Acknowledgement
 
-example:
-```bash
-python run_mvdream.py "a cute owl"
-python run_imagedream.py data/anya_rgba.png
-```
+* The original papers:
+    ```bibtex
+    @article{shi2023MVDream,
+        author = {Shi, Yichun and Wang, Peng and Ye, Jianglong and Mai, Long and Li, Kejie and Yang, Xiao},
+        title = {MVDream: Multi-view Diffusion for 3D Generation},
+        journal = {arXiv:2308.16512},
+        year = {2023},
+    }
+    @article{wang2023imagedream,
+        title={ImageDream: Image-Prompt Multi-view Diffusion for 3D Generation},
+        author={Wang, Peng and Shi, Yichun},
+        journal={arXiv preprint arXiv:2312.02201},
+        year={2023}
+    }
+    ```
+* This codebase is modified from [mvdream-hf](https://github.com/KokeCacao/mvdream-hf).

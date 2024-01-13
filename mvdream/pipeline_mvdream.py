@@ -405,29 +405,27 @@ class MVDreamPipeline(DiffusionPipeline):
     def encode_image(self, image, device, num_images_per_prompt):
         dtype = next(self.image_encoder.parameters()).dtype
 
-        image = (image * 255).astype(np.uint8)
+        if image.dtype == np.float32:
+            image = (image * 255).astype(np.uint8)
+            
         image = self.feature_extractor(image, return_tensors="pt").pixel_values
-        
         image = image.to(device=device, dtype=dtype)
         
-        image_enc_hidden_states = self.image_encoder(image, output_hidden_states=True).hidden_states[-2]
-        image_enc_hidden_states = image_enc_hidden_states.repeat_interleave(num_images_per_prompt, dim=0)
+        image_embeds = self.image_encoder(image, output_hidden_states=True).hidden_states[-2]
+        image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
 
-        # imagedream directly use zero as uncond image embeddings
-        uncond_image_enc_hidden_states = torch.zeros_like(image_enc_hidden_states)
-
-        return uncond_image_enc_hidden_states, image_enc_hidden_states
+        return torch.zeros_like(image_embeds), image_embeds
 
     def encode_image_latents(self, image, device, num_images_per_prompt):
         
-        image = torch.from_numpy(image).unsqueeze(0).permute(0, 3, 1, 2) # [1, 3, H, W]
-        image = image.to(device=device)
-        image = F.interpolate(image, (256, 256), mode='bilinear', align_corners=False)
         dtype = next(self.image_encoder.parameters()).dtype
+
+        image = torch.from_numpy(image).unsqueeze(0).permute(0, 3, 1, 2).to(device=device) # [1, 3, H, W]
+        image = 2 * image - 1
+        image = F.interpolate(image, (256, 256), mode='bilinear', align_corners=False)
         image = image.to(dtype=dtype)
 
         posterior = self.vae.encode(image).latent_dist
-
         latents = posterior.sample() * self.vae.config.scaling_factor # [B, C, H, W]
         latents = latents.repeat_interleave(num_images_per_prompt, dim=0)
 
@@ -436,13 +434,13 @@ class MVDreamPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        prompt: str = "a car",
+        prompt: str = "",
         image: Optional[np.ndarray] = None,
         height: int = 256,
         width: int = 256,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.0,
-        negative_prompt: str = "bad quality",
+        negative_prompt: str = "",
         num_images_per_prompt: int = 1,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -454,7 +452,6 @@ class MVDreamPipeline(DiffusionPipeline):
     ):
         self.unet = self.unet.to(device=device)
         self.vae = self.vae.to(device=device)
-
         self.text_encoder = self.text_encoder.to(device=device)
 
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
@@ -466,10 +463,9 @@ class MVDreamPipeline(DiffusionPipeline):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        # imagedream variant (TODO: debug)
+        # imagedream variant
         if image is not None:
             assert isinstance(image, np.ndarray) and image.dtype == np.float32
-
             self.image_encoder = self.image_encoder.to(device=device)
             image_embeds_neg, image_embeds_pos = self.encode_image(image, device, num_images_per_prompt)
             image_latents_neg, image_latents_pos = self.encode_image_latents(image, device, num_images_per_prompt)
@@ -496,7 +492,11 @@ class MVDreamPipeline(DiffusionPipeline):
             None,
         )
 
-        camera = get_camera(num_frames, extra_view=(actual_num_frames != num_frames)).to(dtype=latents.dtype, device=device)
+        if image is not None:
+            camera = get_camera(num_frames, elevation=5, extra_view=True).to(dtype=latents.dtype, device=device)
+        else:
+            camera = get_camera(num_frames, elevation=15, extra_view=False).to(dtype=latents.dtype, device=device)
+        camera = camera.repeat_interleave(num_images_per_prompt, dim=0)
 
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -508,10 +508,7 @@ class MVDreamPipeline(DiffusionPipeline):
                 # expand the latents if we are doing classifier free guidance
                 multiplier = 2 if do_classifier_free_guidance else 1
                 latent_model_input = torch.cat([latents] * multiplier)
-                latent_model_input = self.scheduler.scale_model_input(
-                    latent_model_input, t
-                )
-
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 unet_inputs = {
                     'x': latent_model_input,

@@ -568,7 +568,7 @@ if __name__ == "__main__":
                 images = pipe(
                     image=input_image,
                     prompt="",
-                    negative_prompt="painting, bad quality, flat",
+                    negative_prompt="",
                     output_type="pil",
                     guidance_scale=5.0,
                     num_inference_steps=50,
@@ -582,7 +582,7 @@ if __name__ == "__main__":
                 images = loaded_pipe(
                     image=input_image,
                     prompt="",
-                    negative_prompt="painting, bad quality, flat",
+                    negative_prompt="",
                     output_type="pil",
                     guidance_scale=5.0,
                     num_inference_steps=50,

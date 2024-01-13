@@ -14,7 +14,7 @@ from .util import (
     timestep_embedding,
 )
 from .attention import SpatialTransformer3D
-from .adaptor import Resampler, ImageProjModel
+from .adaptor import Resampler
 
 import kiui
 
@@ -266,15 +266,13 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         num_heads_upsample=-1,
         use_scale_shift_norm=False,
         resblock_updown=False,
-        transformer_depth=1,  # custom transformer support
-        context_dim=None,  # custom transformer support
-        n_embed=None,  # custom support for prediction of discrete ids into codebook of first stage vq model
-        disable_self_attentions=None,
+        transformer_depth=1,
+        context_dim=None,
+        n_embed=None,
         num_attention_blocks=None,
-        disable_middle_self_attn=False,
         adm_in_channels=None,
         camera_dim=None,
-        ip_dim=0,
+        ip_dim=0, # imagedream uses ip_dim > 0
         ip_weight=1.0,
         **kwargs,
     ):
@@ -604,7 +602,7 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         
         # imagedream variant
         if self.ip_dim > 0:
-            x[(num_frames - 1) :: num_frames, :, :, :] = ip_img
+            x[(num_frames - 1) :: num_frames, :, :, :] = ip_img # place at [4, 9]
             ip_emb = self.image_embed(ip)
             context = torch.cat((context, ip_emb), 1)
 

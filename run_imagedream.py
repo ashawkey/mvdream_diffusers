@@ -17,9 +17,9 @@ parser.add_argument("image", type=str, default='data/anya_rgba.png')
 parser.add_argument("--prompt", type=str, default="")
 args = parser.parse_args()
 
-while True:
+for i in range(5):
     input_image = kiui.read_image(args.image, mode='float')
-    image = pipe(args.prompt, input_image)
+    image = pipe(args.prompt, input_image, guidance_scale=5)
     grid = np.concatenate(
         [
             np.concatenate([image[0], image[2]], axis=0),
@@ -28,5 +28,4 @@ while True:
         axis=1,
     )
     # kiui.vis.plot_image(grid)
-    kiui.write_image('test_imagedream.jpg', grid)
-    break
+    kiui.write_image(f'test_imagedream_{i}.jpg', grid)

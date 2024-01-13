@@ -1,0 +1,6 @@
+omegaconf 
+diffusers 
+safetensors 
+huggingface_hub 
+transformers 
+accelerate
