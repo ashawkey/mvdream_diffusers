@@ -3,8 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin
 from diffusers.models.modeling_utils import ModelMixin
-from typing import Any, List, Optional
-from torch import Tensor
+from typing import Any, List
 
 from .util import (
     checkpoint,
@@ -15,8 +14,6 @@ from .util import (
 )
 from .attention import SpatialTransformer3D
 from .adaptor import Resampler
-
-import kiui
 
 class CondSequential(nn.Sequential):
     """

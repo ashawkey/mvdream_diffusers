@@ -6,9 +6,11 @@ from mvdream.pipeline_mvdream import MVDreamPipeline
 
 pipe = MVDreamPipeline.from_pretrained(
     "./weights_mvdream", # local weights
-    # "ashawkey/mvdream-sd2.1-diffusers",
-    torch_dtype=torch.float16
+    # 'ashawkey/mvdream-sd2.1-diffusers', # remote is not 
+    torch_dtype=torch.float16,
+    trust_remote_code=True,
 )
+
 pipe = pipe.to("cuda")
 
 

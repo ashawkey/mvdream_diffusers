@@ -18,8 +18,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from .models import MultiViewUNetModel
 from .util import get_camera
 
-import kiui
-
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 

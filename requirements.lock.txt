@@ -4,3 +4,4 @@ safetensors == 0.4.1
 huggingface_hub == 0.19.4
 transformers == 4.35.2
 accelerate == 0.25.0.dev0
+kiui == 0.2.0

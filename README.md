@@ -22,6 +22,7 @@ pip install -r requirements.txt
 MVDream:
 ```bash
 # download original ckpt (we only support the SD 2.1 version)
+mkdir models
 cd models
 wget https://huggingface.co/MVDream/MVDream/resolve/main/sd-v2.1-base-4view.pt
 wget https://raw.githubusercontent.com/bytedance/MVDream/main/mvdream/configs/sd-v2-base.yaml

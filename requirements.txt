@@ -4,3 +4,4 @@ safetensors
 huggingface_hub 
 transformers 
 accelerate
+kiui
