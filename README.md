@@ -11,6 +11,10 @@ We provide converted `fp16` weights on huggingface:
 ```bash
 # dependency
 pip install -r requirements.txt
+
+# xformers is required! please refer to https://github.com/facebookresearch/xformers
+pip install ninja
+pip install -v -U git+https://github.com/facebookresearch/xformers.git@main#egg=xformers
 ```
 
 ### Usage

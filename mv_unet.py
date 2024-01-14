@@ -39,55 +39,6 @@ def get_camera(
     return torch.from_numpy(np.stack(cameras, axis=0)).float() # [num_frames, 16]
 
 
-def checkpoint(func, inputs, params, flag):
-    """
-    Evaluate a function without caching intermediate activations, allowing for
-    reduced memory at the expense of extra compute in the backward pass.
-    :param func: the function to evaluate.
-    :param inputs: the argument sequence to pass to `func`.
-    :param params: a sequence of parameters `func` depends on but does not
-                   explicitly take as arguments.
-    :param flag: if False, disable gradient checkpointing.
-    """
-    if flag:
-        args = tuple(inputs) + tuple(params)
-        return CheckpointFunction.apply(func, len(inputs), *args)
-    else:
-        return func(*inputs)
-
-
-class CheckpointFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, run_function, length, *args):
-        ctx.run_function = run_function
-        ctx.input_tensors = list(args[:length])
-        ctx.input_params = list(args[length:])
-
-        with torch.no_grad():
-            output_tensors = ctx.run_function(*ctx.input_tensors)
-        return output_tensors
-
-    @staticmethod
-    def backward(ctx, *output_grads):
-        ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with torch.enable_grad():
-            # Fixes a bug where the first op in run_function modifies the
-            # Tensor storage in place, which is not allowed for detach()'d
-            # Tensors.
-            shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
-            output_tensors = ctx.run_function(*shallow_copies)
-        input_grads = torch.autograd.grad(
-            output_tensors,
-            ctx.input_tensors + ctx.input_params,
-            output_grads,
-            allow_unused=True,
-        )
-        del ctx.input_tensors
-        del ctx.input_params
-        del output_tensors
-        return (None, None) + input_grads
-
-
 def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
     """
     Create sinusoidal timestep embeddings.
@@ -286,7 +237,6 @@ class BasicTransformerBlock3D(nn.Module):
         context_dim,
         dropout=0.0,
         gated_ff=True,
-        checkpoint=True,
         ip_dim=0,
         ip_weight=1,
     ):
@@ -313,14 +263,8 @@ class BasicTransformerBlock3D(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.norm3 = nn.LayerNorm(dim)
-        self.checkpoint = checkpoint
 
     def forward(self, x, context=None, num_frames=1):
-        return checkpoint(
-            self._forward, (x, context, num_frames), self.parameters(), self.checkpoint
-        )
-
-    def _forward(self, x, context=None, num_frames=1):
         x = rearrange(x, "(b f) l c -> b (f l) c", f=num_frames).contiguous()
         x = self.attn1(self.norm1(x), context=None) + x
         x = rearrange(x, "b (f l) c -> (b f) l c", f=num_frames).contiguous()
@@ -341,7 +285,6 @@ class SpatialTransformer3D(nn.Module):
         dropout=0.0,
         ip_dim=0,
         ip_weight=1,
-        use_checkpoint=True,
     ):
         super().__init__()
 
@@ -362,7 +305,6 @@ class SpatialTransformer3D(nn.Module):
                     d_head,
                     context_dim=context_dim[d],
                     dropout=dropout,
-                    checkpoint=use_checkpoint,
                     ip_dim=ip_dim,
                     ip_weight=ip_weight,
                 )
@@ -581,7 +523,6 @@ class ResBlock(nn.Module):
         convolution instead of a smaller 1x1 convolution to change the
         channels in the skip connection.
     :param dims: determines if the signal is 1D, 2D, or 3D.
-    :param use_checkpoint: if True, use gradient checkpointing on this module.
     :param up: if True, use this block for upsampling.
     :param down: if True, use this block for downsampling.
     """
@@ -595,7 +536,6 @@ class ResBlock(nn.Module):
         use_conv=False,
         use_scale_shift_norm=False,
         dims=2,
-        use_checkpoint=False,
         up=False,
         down=False,
     ):
@@ -605,7 +545,6 @@ class ResBlock(nn.Module):
         self.dropout = dropout
         self.out_channels = out_channels or channels
         self.use_conv = use_conv
-        self.use_checkpoint = use_checkpoint
         self.use_scale_shift_norm = use_scale_shift_norm
 
         self.in_layers = nn.Sequential(
@@ -651,17 +590,6 @@ class ResBlock(nn.Module):
             self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
 
     def forward(self, x, emb):
-        """
-        Apply the block to a Tensor, conditioned on a timestep embedding.
-        :param x: an [N x C x ...] Tensor of features.
-        :param emb: an [N x emb_channels] Tensor of timestep embeddings.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
-        return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
-        )
-
-    def _forward(self, x, emb):
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -702,7 +630,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
     :param dims: determines if the signal is 1D, 2D, or 3D.
     :param num_classes: if specified (as an int), then this model will be
         class-conditional with `num_classes` classes.
-    :param use_checkpoint: use gradient checkpointing to reduce memory usage.
     :param num_heads: the number of attention heads in each attention layer.
     :param num_heads_channels: if specified, ignore num_heads and instead use
                                a fixed channel width per attention head.
@@ -728,7 +655,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         conv_resample=True,
         dims=2,
         num_classes=None,
-        use_checkpoint=False,
         num_heads=-1,
         num_head_channels=-1,
         num_heads_upsample=-1,
@@ -794,7 +720,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
         self.num_classes = num_classes
-        self.use_checkpoint = use_checkpoint
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
@@ -868,7 +793,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                         dropout,
                         out_channels=mult * model_channels,
                         dims=dims,
-                        use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
                     )
                 ]
@@ -888,7 +812,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                                 dim_head,
                                 context_dim=context_dim,
                                 depth=transformer_depth,
-                                use_checkpoint=use_checkpoint,
                                 ip_dim=self.ip_dim,
                                 ip_weight=self.ip_weight,
                             )
@@ -906,7 +829,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                             dropout,
                             out_channels=out_ch,
                             dims=dims,
-                            use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             down=True,
                         )
@@ -933,7 +855,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                 time_embed_dim,
                 dropout,
                 dims=dims,
-                use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
             SpatialTransformer3D(
@@ -942,7 +863,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                 dim_head,
                 context_dim=context_dim,
                 depth=transformer_depth,
-                use_checkpoint=use_checkpoint,
                 ip_dim=self.ip_dim,
                 ip_weight=self.ip_weight,
             ), 
@@ -951,7 +871,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                 time_embed_dim,
                 dropout,
                 dims=dims,
-                use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
         )
@@ -968,7 +887,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                         dropout,
                         out_channels=model_channels * mult,
                         dims=dims,
-                        use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
                     )
                 ]
@@ -988,7 +906,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                                 dim_head,
                                 context_dim=context_dim,
                                 depth=transformer_depth,
-                                use_checkpoint=use_checkpoint,
                                 ip_dim=self.ip_dim,
                                 ip_weight=self.ip_weight,
                             )
@@ -1002,7 +919,6 @@ class MultiViewUNetModel(ModelMixin, ConfigMixin):
                             dropout,
                             out_channels=out_ch,
                             dims=dims,
-                            use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             up=True,
                         )
