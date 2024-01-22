@@ -20,7 +20,7 @@ args = parser.parse_args()
 
 for i in range(5):
     input_image = kiui.read_image(args.image, mode='float')
-    image = pipe(args.prompt, input_image, guidance_scale=5)
+    image = pipe(args.prompt, input_image, guidance_scale=5, num_inference_steps=30, elevation=0)
     grid = np.concatenate(
         [
             np.concatenate([image[0], image[2]], axis=0),

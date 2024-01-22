@@ -435,6 +435,7 @@ class MVDreamPipeline(DiffusionPipeline):
         image: Optional[np.ndarray] = None,
         height: int = 256,
         width: int = 256,
+        elevation: float = 0,
         num_inference_steps: int = 50,
         guidance_scale: float = 7.0,
         negative_prompt: str = "",
@@ -489,10 +490,8 @@ class MVDreamPipeline(DiffusionPipeline):
             None,
         )
 
-        if image is not None:
-            camera = get_camera(num_frames, elevation=5, extra_view=True).to(dtype=latents.dtype, device=device)
-        else:
-            camera = get_camera(num_frames, elevation=15, extra_view=False).to(dtype=latents.dtype, device=device)
+        # Get camera
+        camera = get_camera(num_frames, elevation=elevation, extra_view=(image is not None)).to(dtype=latents.dtype, device=device)
         camera = camera.repeat_interleave(num_images_per_prompt, dim=0)
 
         # Prepare extra step kwargs.

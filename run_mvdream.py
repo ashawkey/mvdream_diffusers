@@ -19,7 +19,7 @@ parser.add_argument("prompt", type=str, default="a cute owl 3d model")
 args = parser.parse_args()
 
 for i in range(5):
-    image = pipe(args.prompt)
+    image = pipe(args.prompt, guidance_scale=5, num_inference_steps=30, elevation=0)
     grid = np.concatenate(
         [
             np.concatenate([image[0], image[2]], axis=0),
